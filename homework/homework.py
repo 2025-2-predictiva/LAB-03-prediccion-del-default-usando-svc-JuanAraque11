@@ -95,3 +95,132 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+
+import json, gzip, os, pickle, zipfile
+from pathlib import Path
+import pandas as pd
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.svm import SVC
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import (
+    balanced_accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+)
+
+# Variables globales - Importantes
+RUTA_BASE_INPUT = Path("files/input")
+RUTA_BASE_OUTPUT = Path("files")
+TRAIN_ZIP_PATH = RUTA_BASE_INPUT / "train_data.csv.zip"
+TEST_ZIP_PATH = RUTA_BASE_INPUT / "test_data.csv.zip"
+NOMBRE_TRAIN = "train_default_of_credit_card_clients.csv"
+NOMBRE_TEST = "test_default_of_credit_card_clients.csv"
+MODEL_PATH = RUTA_BASE_OUTPUT / "models/model.pkl.gz"
+METRICS_PATH = RUTA_BASE_OUTPUT / "output/metrics.json"
+
+CATEGORICAL_COLS = ["SEX", "EDUCATION", "MARRIAGE"]
+NUMERICAL_COLS = [
+    "LIMIT_BAL", "AGE", "PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6",
+    "BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6",
+    "PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6"
+]
+TARGET_COL = "default"
+
+
+def cargar_csv_desde_zip(ruta_zip: Path, nombre_interno: str) -> pd.DataFrame:
+    with zipfile.ZipFile(ruta_zip) as zf, zf.open(nombre_interno) as f:
+        return pd.read_csv(f)
+
+
+def limpiar_datos(df: pd.DataFrame) -> pd.DataFrame:
+    df = (
+        df.drop(columns="ID")
+          .rename(columns={"default payment next month": TARGET_COL})
+          .dropna()
+    )
+    df = df[(df["EDUCATION"] != 0) & (df["MARRIAGE"] != 0)]
+    df.loc[df["EDUCATION"] > 4, "EDUCATION"] = 4
+    return df
+
+
+def crear_modelo_y_busqueda() -> GridSearchCV:
+    preproc = ColumnTransformer([
+        ("cat", OneHotEncoder(handle_unknown="ignore"), CATEGORICAL_COLS),
+        ("num", StandardScaler(), NUMERICAL_COLS)
+    ], remainder="passthrough")
+
+    pipe = Pipeline([
+        ("prep", preproc),
+        ("pca", PCA()),
+        ("kbest", SelectKBest(score_func=f_classif)),
+        ("svc", SVC(kernel="rbf", random_state=42))
+    ])
+
+    grid = {
+        "pca__n_components": [20, 21],
+        "kbest__k": [12],
+        "svc__gamma": [0.099]
+    }
+
+    return GridSearchCV(pipe, grid, cv=10, scoring="balanced_accuracy",
+                        refit=True, verbose=1, return_train_score=False)
+
+
+def calcular_metricas(nombre: str, y_true, y_pred) -> dict:
+    return {
+        "type": "metrics", "dataset": nombre,
+        "precision": precision_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred),
+        "f1_score": f1_score(y_true, y_pred)
+    }
+
+
+def calcular_matriz_confusion(nombre: str, y_true, y_pred) -> dict:
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    return {
+        "type": "cm_matrix", "dataset": nombre,
+        "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+        "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)}
+    }
+
+
+def guardar_modelo(objeto) -> None:
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(MODEL_PATH, "wb") as f:
+        pickle.dump(objeto, f)
+
+
+def guardar_resultados_jsonl(resultados: list[dict]) -> None:
+    METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(METRICS_PATH, "w", encoding="utf-8") as f:
+        f.writelines(json.dumps(r) + "\n" for r in resultados)
+
+
+def main():
+
+    df_train = limpiar_datos(cargar_csv_desde_zip(TRAIN_ZIP_PATH, NOMBRE_TRAIN))
+    df_test = limpiar_datos(cargar_csv_desde_zip(TEST_ZIP_PATH, NOMBRE_TEST))
+
+    X_tr, y_tr = df_train.drop(TARGET_COL, axis=1), df_train[TARGET_COL]
+    X_te, y_te = df_test.drop(TARGET_COL, axis=1), df_test[TARGET_COL]
+
+    search = crear_modelo_y_busqueda()
+    search.fit(X_tr, y_tr)
+    guardar_modelo(search)
+
+    y_tr_pred, y_te_pred = search.predict(X_tr), search.predict(X_te)
+    resultados = [
+        calcular_metricas("train", y_tr, y_tr_pred),
+        calcular_metricas("test", y_te, y_te_pred),
+        calcular_matriz_confusion("train", y_tr, y_tr_pred),
+        calcular_matriz_confusion("test", y_te, y_te_pred)
+    ]
+
+    guardar_resultados_jsonl(resultados)
+
+if __name__ == "__main__":
+    main()
